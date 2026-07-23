@@ -109,6 +109,7 @@ export {
 	type OverlayUnfocusOptions,
 	type SizeValue,
 	TUI,
+	type ViewportLayout,
 } from "./tui.ts";
 // Utilities
 export { sliceByColumn, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "./utils.ts";

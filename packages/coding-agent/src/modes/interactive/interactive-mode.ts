@@ -318,6 +318,9 @@ export interface InteractiveModeOptions {
 export class InteractiveMode {
 	private runtimeHost: AgentSessionRuntime;
 	private ui: TUI;
+	private scrollableContainer: Container;
+	private fixedContainer: Container;
+	private footerContainer: Container;
 	private loadedResourcesContainer: Container;
 	private chatContainer: Container;
 	private pendingMessagesContainer: Container;
@@ -453,6 +456,9 @@ export class InteractiveMode {
 		this.version = VERSION;
 		this.ui = new TUI(new ProcessTerminal(), this.settingsManager.getShowHardwareCursor(), getAgentDir());
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
+		this.scrollableContainer = new Container();
+		this.fixedContainer = new Container();
+		this.footerContainer = new Container();
 		this.headerContainer = new Container();
 		this.loadedResourcesContainer = new Container();
 		this.chatContainer = new Container();
@@ -699,19 +705,22 @@ export class InteractiveMode {
 			console.log(theme.fg("dim", `Model scope: ${modelList}${cycleHint}`));
 		}
 
-		// Add header container as first child. Populate it after applying theme settings.
-		// Keep loaded resources before chat so restored session messages never precede them.
-		this.ui.addChild(this.headerContainer);
-		this.ui.addChild(this.loadedResourcesContainer);
-
-		this.ui.addChild(this.chatContainer);
-		this.ui.addChild(this.pendingMessagesContainer);
-		this.ui.addChild(this.statusContainer);
+		// Keep the transcript in an internally scrollable region while editor UI
+		// remains pinned to the bottom of the alternate screen.
+		this.scrollableContainer.addChild(this.headerContainer);
+		this.scrollableContainer.addChild(this.loadedResourcesContainer);
+		this.scrollableContainer.addChild(this.chatContainer);
+		this.scrollableContainer.addChild(this.pendingMessagesContainer);
+		this.scrollableContainer.addChild(this.statusContainer);
 		this.renderWidgets(); // Initialize with default spacer
-		this.ui.addChild(this.widgetContainerAbove);
-		this.ui.addChild(this.editorContainer);
-		this.ui.addChild(this.widgetContainerBelow);
-		this.ui.addChild(this.footer);
+		this.fixedContainer.addChild(this.widgetContainerAbove);
+		this.fixedContainer.addChild(this.editorContainer);
+		this.fixedContainer.addChild(this.widgetContainerBelow);
+		this.footerContainer.addChild(this.footer);
+		this.fixedContainer.addChild(this.footerContainer);
+		this.ui.addChild(this.scrollableContainer);
+		this.ui.addChild(this.fixedContainer);
+		this.ui.setViewportLayout({ scrollable: this.scrollableContainer, fixed: this.fixedContainer });
 		this.ui.setFocus(this.editor);
 
 		this.setupKeyHandlers();
@@ -2032,21 +2041,16 @@ export class InteractiveMode {
 			this.customFooter.dispose();
 		}
 
-		// Remove current footer from UI
-		if (this.customFooter) {
-			this.ui.removeChild(this.customFooter);
-		} else {
-			this.ui.removeChild(this.footer);
-		}
+		this.footerContainer.clear();
 
 		if (factory) {
 			// Create and add custom footer, passing the data provider
 			this.customFooter = factory(this.ui, theme, this.footerDataProvider);
-			this.ui.addChild(this.customFooter);
+			this.footerContainer.addChild(this.customFooter);
 		} else {
 			// Restore built-in footer
 			this.customFooter = undefined;
-			this.ui.addChild(this.footer);
+			this.footerContainer.addChild(this.footer);
 		}
 
 		this.ui.requestRender();
@@ -2591,6 +2595,10 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.message.copy", () => void this.handleCopyCommand());
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
 		this.defaultEditor.onAction("app.message.dequeue", () => this.handleDequeue());
+		this.defaultEditor.onAction("app.transcript.pageUp", () => this.ui.scrollViewportPage("up"));
+		this.defaultEditor.onAction("app.transcript.pageDown", () => this.ui.scrollViewportPage("down"));
+		this.defaultEditor.onAction("app.transcript.top", () => this.ui.scrollViewportToTop());
+		this.defaultEditor.onAction("app.transcript.bottom", () => this.ui.scrollViewportToBottom());
 		this.defaultEditor.onAction("app.session.new", () => this.handleClearCommand());
 		this.defaultEditor.onAction("app.session.tree", () => this.showTreeSelector());
 		this.defaultEditor.onAction("app.session.fork", () => this.showUserMessageSelector());
@@ -2639,6 +2647,7 @@ export class InteractiveMode {
 	private setupEditorSubmitHandler(): void {
 		this.defaultEditor.onSubmit = async (text: string) => {
 			text = text.trim();
+			this.ui.scrollViewportToBottom();
 			if (!text) return;
 
 			// Handle commands
@@ -5714,8 +5723,10 @@ export class InteractiveMode {
 		const cursorLineEnd = this.getEditorKeyDisplay("tui.editor.cursorLineEnd");
 		const jumpForward = this.getEditorKeyDisplay("tui.editor.jumpForward");
 		const jumpBackward = this.getEditorKeyDisplay("tui.editor.jumpBackward");
-		const pageUp = this.getEditorKeyDisplay("tui.editor.pageUp");
-		const pageDown = this.getEditorKeyDisplay("tui.editor.pageDown");
+		const pageUp = this.getAppKeyDisplay("app.transcript.pageUp");
+		const pageDown = this.getAppKeyDisplay("app.transcript.pageDown");
+		const transcriptTop = this.getAppKeyDisplay("app.transcript.top");
+		const transcriptBottom = this.getAppKeyDisplay("app.transcript.bottom");
 
 		// Editing keybindings
 		const submit = this.getEditorKeyDisplay("tui.input.submit");
@@ -5756,7 +5767,8 @@ export class InteractiveMode {
 | \`${cursorLineEnd}\` | End of line |
 | \`${jumpForward}\` | Jump forward to character |
 | \`${jumpBackward}\` | Jump backward to character |
-| \`${pageUp}\` / \`${pageDown}\` | Scroll by page |
+| \`${pageUp}\` / \`${pageDown}\` | Scroll transcript by page |
+| \`${transcriptTop}\` / \`${transcriptBottom}\` | Start / end of transcript |
 
 **Editing**
 | Key | Action |

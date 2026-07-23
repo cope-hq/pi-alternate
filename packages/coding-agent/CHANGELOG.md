@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added alternate-screen interactive mode with internal transcript scrollback, a pinned editor/footer, Page Up/Down and mouse-wheel navigation, text selection and copying, and clickable hyperlinks.
+
 ## [0.82.0] - 2026-07-24
 
 ### New Features

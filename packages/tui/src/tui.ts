@@ -2,6 +2,7 @@
  * Minimal TUI implementation with differential rendering
  */
 
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -16,7 +17,15 @@ import {
 	type TerminalColorScheme,
 } from "./terminal-colors.ts";
 import { deleteKittyImage, getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.ts";
-import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.ts";
+import {
+	extractAnsiCode,
+	extractSegments,
+	getGraphemeSegmenter,
+	normalizeTerminalOutput,
+	sliceByColumn,
+	sliceWithWidth,
+	visibleWidth,
+} from "./utils.ts";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
 
@@ -238,6 +247,20 @@ type OverlayStackEntry = {
 	focusOrder: number;
 };
 
+export interface ViewportLayout {
+	/** Content that participates in internal scrollback. */
+	scrollable: Component;
+	/** Content pinned to the bottom of the terminal. */
+	fixed: Component;
+	/** Override how selected text is copied. Defaults to OSC 52. */
+	onCopySelection?: (text: string) => void | Promise<void>;
+	/** Override how clicked OSC 8 links are opened. Defaults to the platform handler. */
+	onOpenLink?: (url: string) => void | Promise<void>;
+}
+
+type ViewportPoint = { row: number; col: number };
+type ViewportSelection = { anchor: ViewportPoint; focus: ViewportPoint; dragging: boolean };
+
 type OverlayBlockedFocusResume = { status: "restore-overlay" } | { status: "focus-target"; target: Component | null };
 type EligibleOverlayFocusRestoreState = { status: "eligible"; overlay: OverlayStackEntry };
 type BlockedOverlayFocusRestoreState = {
@@ -320,6 +343,12 @@ export class TUI extends Container {
 	private terminalColorSchemeListeners = new Set<(scheme: TerminalColorScheme) => void>();
 	private terminalColorSchemeNotificationsEnabled = false;
 	private readonly logDirectory: string;
+	private viewportLayout: ViewportLayout | undefined;
+	private viewportOffset = 0;
+	private previousScrollableLineCount = 0;
+	private alternateScreenActive = false;
+	private viewportFrameLines: string[] = [];
+	private viewportSelection: ViewportSelection | undefined;
 
 	// Overlay stack for modal components rendered on top of base content
 	private focusOrderCounter = 0;
@@ -363,6 +392,47 @@ export class TUI extends Container {
 	 */
 	setClearOnShrink(enabled: boolean): void {
 		this.clearOnShrink = enabled;
+	}
+
+	/**
+	 * Enable a full-screen viewport with internal scrollback. The scrollable
+	 * component is clipped above the fixed component, which remains pinned to
+	 * the bottom of the terminal.
+	 */
+	setViewportLayout(layout: ViewportLayout | undefined): void {
+		this.viewportLayout = layout;
+		this.viewportOffset = 0;
+		this.previousScrollableLineCount = 0;
+		this.viewportFrameLines = [];
+		this.viewportSelection = undefined;
+	}
+
+	getViewportOffset(): number {
+		return this.viewportOffset;
+	}
+
+	scrollViewportBy(lines: number): void {
+		if (!this.viewportLayout || lines === 0) return;
+		this.viewportOffset = Math.max(0, this.viewportOffset + lines);
+		this.viewportSelection = undefined;
+		this.requestRender();
+	}
+
+	scrollViewportPage(direction: "up" | "down"): void {
+		const pageSize = Math.max(1, this.terminal.rows - 3);
+		this.scrollViewportBy(direction === "up" ? pageSize : -pageSize);
+	}
+
+	scrollViewportToTop(): void {
+		if (!this.viewportLayout) return;
+		this.viewportOffset = Number.MAX_SAFE_INTEGER;
+		this.requestRender();
+	}
+
+	scrollViewportToBottom(): void {
+		if (!this.viewportLayout || this.viewportOffset === 0) return;
+		this.viewportOffset = 0;
+		this.requestRender();
 	}
 
 	setFocus(component: Component | null): void {
@@ -636,6 +706,11 @@ export class TUI extends Container {
 
 	start(): void {
 		this.stopped = false;
+		if (this.viewportLayout) {
+			this.terminal.write("\x1b[?1049h\x1b[2J\x1b[H");
+			this.terminal.write("\x1b[?1002h\x1b[?1006h");
+			this.alternateScreenActive = true;
+		}
 		this.terminal.start(
 			(data) => this.handleInput(data),
 			() => this.requestRender(),
@@ -645,7 +720,7 @@ export class TUI extends Container {
 			this.terminal.write("\x1b[?2031h");
 		}
 		this.queryCellSize();
-		this.requestRender();
+		this.requestRender(this.viewportLayout !== undefined);
 	}
 
 	addInputListener(listener: InputListener): () => void {
@@ -695,6 +770,16 @@ export class TUI extends Container {
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031l");
 		}
+		if (this.alternateScreenActive) {
+			this.terminal.write(this.deleteKittyImages(this.previousKittyImageIds));
+			this.terminal.write("\x1b[?1006l\x1b[?1002l");
+			this.terminal.stop();
+			this.terminal.write("\x1b[?1049l");
+			this.terminal.showCursor();
+			this.alternateScreenActive = false;
+			return;
+		}
+
 		// Move cursor to the end of the content to prevent overwriting/artifacts on exit
 		if (this.previousLines.length > 0) {
 			// Overwrite the inverted cursor with a normal space to clear the artifact
@@ -762,7 +847,177 @@ export class TUI extends Container {
 		}, delay);
 	}
 
+	private handleViewportMouse(data: string): boolean {
+		const match = data.match(/^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/);
+		if (!match || !this.viewportLayout) return false;
+
+		const button = Number.parseInt(match[1], 10);
+		if ((button & 64) !== 0) {
+			this.scrollViewportBy((button & 1) === 0 ? 3 : -3);
+			return true;
+		}
+
+		const point = {
+			row: Math.max(0, Math.min(this.terminal.rows - 1, Number.parseInt(match[3], 10) - 1)),
+			col: Math.max(0, Math.min(this.terminal.columns - 1, Number.parseInt(match[2], 10) - 1)),
+		};
+		const isMotion = (button & 32) !== 0;
+		const isLeftButton = (button & 3) === 0;
+		const isRelease = match[4] === "m";
+
+		if (isLeftButton && !isMotion && !isRelease) {
+			this.viewportSelection = { anchor: point, focus: point, dragging: false };
+			this.requestRender();
+			return true;
+		}
+
+		if (isLeftButton && isMotion && this.viewportSelection) {
+			this.viewportSelection.focus = point;
+			this.viewportSelection.dragging =
+				point.row !== this.viewportSelection.anchor.row || point.col !== this.viewportSelection.anchor.col;
+			this.requestRender();
+			return true;
+		}
+
+		if (isRelease && this.viewportSelection) {
+			this.viewportSelection.focus = point;
+			const selection = this.viewportSelection;
+			selection.dragging =
+				selection.dragging || point.row !== selection.anchor.row || point.col !== selection.anchor.col;
+			if (selection.dragging) {
+				const text = this.getSelectedViewportText(selection);
+				if (text) this.copyViewportSelection(text);
+			} else {
+				const url = this.getViewportLinkAt(point);
+				this.viewportSelection = undefined;
+				if (url) this.openViewportLink(url);
+			}
+			this.requestRender();
+			return true;
+		}
+
+		return true;
+	}
+
+	private getOrderedViewportSelection(selection: ViewportSelection): { start: ViewportPoint; end: ViewportPoint } {
+		const anchorFirst =
+			selection.anchor.row < selection.focus.row ||
+			(selection.anchor.row === selection.focus.row && selection.anchor.col <= selection.focus.col);
+		return anchorFirst
+			? { start: selection.anchor, end: selection.focus }
+			: { start: selection.focus, end: selection.anchor };
+	}
+
+	private getSelectedViewportText(selection: ViewportSelection): string {
+		const { start, end } = this.getOrderedViewportSelection(selection);
+		const selectedLines: string[] = [];
+		for (let row = start.row; row <= end.row; row++) {
+			const line = this.viewportFrameLines[row] ?? "";
+			const width = visibleWidth(line);
+			const startCol = row === start.row ? Math.min(start.col, width) : 0;
+			const endCol = row === end.row ? Math.min(end.col + 1, width) : width;
+			selectedLines.push(this.stripTerminalCodes(sliceByColumn(line, startCol, Math.max(0, endCol - startCol))));
+		}
+		return selectedLines.join("\n");
+	}
+
+	private stripTerminalCodes(text: string): string {
+		let result = "";
+		let index = 0;
+		while (index < text.length) {
+			const ansi = extractAnsiCode(text, index);
+			if (ansi) {
+				index += ansi.length;
+				continue;
+			}
+			result += text[index];
+			index++;
+		}
+		return result;
+	}
+
+	private copyViewportSelection(text: string): void {
+		const callback = this.viewportLayout?.onCopySelection;
+		if (callback) {
+			Promise.resolve(callback(text)).catch(() => {});
+			return;
+		}
+		const encoded = Buffer.from(text).toString("base64");
+		if (encoded.length <= 100_000) this.terminal.write(`\x1b]52;c;${encoded}\x07`);
+	}
+
+	private getViewportLinkAt(point: ViewportPoint): string | undefined {
+		const line = this.viewportFrameLines[point.row];
+		if (!line) return undefined;
+
+		let activeUrl: string | undefined;
+		let column = 0;
+		let index = 0;
+		while (index < line.length) {
+			const ansi = extractAnsiCode(line, index);
+			if (ansi) {
+				if (ansi.code.startsWith("\x1b]8;")) {
+					const terminatorLength = ansi.code.endsWith("\x07") ? 1 : 2;
+					const body = ansi.code.slice(4, -terminatorLength);
+					const separator = body.indexOf(";");
+					if (separator !== -1) activeUrl = body.slice(separator + 1) || undefined;
+				}
+				index += ansi.length;
+				continue;
+			}
+
+			let textEnd = index;
+			while (textEnd < line.length && !extractAnsiCode(line, textEnd)) textEnd++;
+			for (const { segment } of getGraphemeSegmenter().segment(line.slice(index, textEnd))) {
+				const width = visibleWidth(segment);
+				if (point.col >= column && point.col < column + width) return activeUrl;
+				column += width;
+			}
+			index = textEnd;
+		}
+		return undefined;
+	}
+
+	private openViewportLink(url: string): void {
+		const callback = this.viewportLayout?.onOpenLink;
+		if (callback) {
+			Promise.resolve(callback(url)).catch(() => {});
+			return;
+		}
+		const [command, args]: [string, string[]] =
+			process.platform === "darwin"
+				? ["open", [url]]
+				: process.platform === "win32"
+					? ["rundll32", ["url.dll,FileProtocolHandler", url]]
+					: ["xdg-open", [url]];
+		spawn(command, args, { stdio: "ignore", detached: true })
+			.on("error", () => {})
+			.unref();
+	}
+
+	private applyViewportSelection(lines: string[]): string[] {
+		const selection = this.viewportSelection;
+		if (!selection?.dragging) return lines;
+
+		const result = [...lines];
+		const { start, end } = this.getOrderedViewportSelection(selection);
+		for (let row = start.row; row <= end.row; row++) {
+			const line = result[row] ?? "";
+			const width = visibleWidth(line);
+			const startCol = row === start.row ? Math.min(start.col, width) : 0;
+			const endCol = row === end.row ? Math.min(end.col + 1, width) : width;
+			if (endCol <= startCol) continue;
+			const before = sliceByColumn(line, 0, startCol);
+			const selected = sliceByColumn(line, startCol, endCol - startCol);
+			const after = sliceByColumn(line, endCol, Math.max(0, width - endCol));
+			result[row] = `${before}\x1b[7m${selected.replace(/\x1b\[([\d;]*)m/g, "$&\x1b[7m")}\x1b[27m${after}`;
+		}
+		return result;
+	}
+
 	private handleInput(data: string): void {
+		if (this.handleViewportMouse(data)) return;
+
 		if (this.consumeOsc11BackgroundResponse(data)) {
 			return;
 		}
@@ -1255,6 +1510,82 @@ export class TUI extends Container {
 		return null;
 	}
 
+	private renderViewport(width: number, height: number): string[] {
+		const layout = this.viewportLayout;
+		if (!layout) return this.render(width);
+
+		const scrollableLines = layout.scrollable.render(width);
+		const fixedLines = layout.fixed.render(width).slice(-height);
+		const availableRows = Math.max(0, height - fixedLines.length);
+
+		if (this.viewportOffset > 0 && scrollableLines.length > this.previousScrollableLineCount) {
+			this.viewportOffset += scrollableLines.length - this.previousScrollableLineCount;
+		}
+		this.previousScrollableLineCount = scrollableLines.length;
+
+		const maxOffset = Math.max(0, scrollableLines.length - availableRows);
+		this.viewportOffset = Math.min(this.viewportOffset, maxOffset);
+		const end = Math.max(0, scrollableLines.length - this.viewportOffset);
+		const start = Math.max(0, end - availableRows);
+		const visibleScrollableLines = scrollableLines.slice(start, end);
+		const topPadding = Math.max(0, availableRows - visibleScrollableLines.length);
+		return [...Array.from({ length: topPadding }, () => ""), ...visibleScrollableLines, ...fixedLines];
+	}
+
+	private renderViewportFrame(
+		newLines: string[],
+		cursorPos: { row: number; col: number } | null,
+		width: number,
+	): void {
+		let buffer = "\x1b[?2026h";
+		let lastChangedRow = this.hardwareCursorRow;
+		const maxLines = Math.max(newLines.length, this.previousLines.length);
+		const changedRows = new Set<number>();
+		let imageChanged = false;
+		for (let row = 0; row < maxLines; row++) {
+			const oldLine = this.previousLines[row] ?? "";
+			const newLine = newLines[row] ?? "";
+			if (oldLine === newLine) continue;
+			changedRows.add(row);
+			if (isImageLine(oldLine) || isImageLine(newLine)) imageChanged = true;
+		}
+		if (imageChanged) {
+			buffer += this.deleteKittyImages(this.previousKittyImageIds);
+			for (let row = 0; row < newLines.length; row++) {
+				if (isImageLine(newLines[row] ?? "")) changedRows.add(row);
+			}
+		}
+		for (const row of changedRows) {
+			const newLine = newLines[row] ?? "";
+			buffer += `\x1b[${row + 1};1H\x1b[2K`;
+			if (!isImageLine(newLine) && visibleWidth(newLine) > width) {
+				this.stop();
+				throw new Error(`Rendered line ${row} exceeds terminal width (${visibleWidth(newLine)} > ${width}).`);
+			}
+			buffer += newLine;
+			lastChangedRow = row;
+		}
+		buffer += "\x1b[?2026l";
+		this.terminal.write(buffer);
+		this.cursorRow = Math.max(0, newLines.length - 1);
+		this.hardwareCursorRow = lastChangedRow;
+		this.maxLinesRendered = newLines.length;
+		this.previousViewportTop = 0;
+		this.previousLines = newLines;
+		this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+
+		if (!cursorPos) {
+			this.terminal.hideCursor();
+			return;
+		}
+		const targetRow = Math.max(0, Math.min(cursorPos.row, newLines.length - 1));
+		const targetCol = Math.max(0, cursorPos.col);
+		this.terminal.write(`\x1b[${targetRow + 1};${targetCol + 1}H`);
+		this.hardwareCursorRow = targetRow;
+		if (this.showHardwareCursor) this.terminal.showCursor();
+		else this.terminal.hideCursor();
+	}
+
 	private doRender(): void {
 		if (this.stopped) return;
 		const width = this.terminal.columns;
@@ -1272,7 +1603,7 @@ export class TUI extends Container {
 		};
 
 		// Render all components to get new lines
-		let newLines = this.render(width);
+		let newLines = this.renderViewport(width, height);
 
 		// Composite overlays into the rendered lines (before differential compare)
 		if (this.overlayStack.length > 0) {
@@ -1282,7 +1613,18 @@ export class TUI extends Container {
 		// Extract cursor position before applying line resets (marker must be found first)
 		const cursorPos = this.extractCursorPosition(newLines, height);
 
+		if (this.viewportLayout) {
+			this.viewportFrameLines = [...newLines];
+			newLines = this.applyViewportSelection(newLines);
+		}
 		newLines = this.applyLineResets(newLines);
+
+		if (this.viewportLayout) {
+			this.renderViewportFrame(newLines, cursorPos, width);
+			this.previousWidth = width;
+			this.previousHeight = height;
+			return;
+		}
 
 		// Helper to clear scrollback and viewport and render all new lines
 		const fullRender = (clear: boolean): void => {

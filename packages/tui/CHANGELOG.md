@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added alternate-screen viewport rendering with internal scrollback, pinned bottom content, mouse-wheel navigation, text selection and copying, and clickable hyperlinks.
+
 ## [0.82.0] - 2026-07-24
 
 ### Fixed

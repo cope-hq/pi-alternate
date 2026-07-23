@@ -26,6 +26,10 @@ export interface AppKeybindings {
 	"app.message.copy": true;
 	"app.message.followUp": true;
 	"app.message.dequeue": true;
+	"app.transcript.pageUp": true;
+	"app.transcript.pageDown": true;
+	"app.transcript.top": true;
+	"app.transcript.bottom": true;
 	"app.clipboard.pasteImage": true;
 	"app.session.new": true;
 	"app.session.tree": true;
@@ -107,6 +111,22 @@ export const KEYBINDINGS = {
 	"app.message.dequeue": {
 		defaultKeys: "alt+up",
 		description: "Restore queued messages",
+	},
+	"app.transcript.pageUp": {
+		defaultKeys: "pageUp",
+		description: "Scroll transcript up one page",
+	},
+	"app.transcript.pageDown": {
+		defaultKeys: "pageDown",
+		description: "Scroll transcript down one page",
+	},
+	"app.transcript.top": {
+		defaultKeys: "ctrl+home",
+		description: "Scroll to start of transcript",
+	},
+	"app.transcript.bottom": {
+		defaultKeys: "ctrl+end",
+		description: "Scroll to end of transcript",
 	},
 	"app.clipboard.pasteImage": {
 		defaultKeys: process.platform === "win32" ? "alt+v" : "ctrl+v",

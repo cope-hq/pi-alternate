@@ -119,6 +119,21 @@ async execute(toolCallId, params, signal, onUpdate, ctx) {
 }
 ```
 
+## Alternate-Screen Viewports
+
+`TUI.setViewportLayout()` enables the terminal alternate-screen buffer and splits rendering into an internally scrollable region and a bottom-pinned region:
+
+```typescript
+const transcript = new Container();
+const controls = new Container();
+
+ui.addChild(transcript);
+ui.addChild(controls);
+ui.setViewportLayout({ scrollable: transcript, fixed: controls });
+```
+
+When the TUI starts, it enters the alternate screen and enables SGR mouse reporting. It restores the normal screen and mouse state when stopped. Use `scrollViewportPage()`, `scrollViewportBy()`, `scrollViewportToTop()`, and `scrollViewportToBottom()` to navigate. Mouse-wheel events scroll automatically. Dragging selects and copies rendered text, and clicking an OSC 8 hyperlink opens it with the platform's default handler. `onCopySelection` and `onOpenLink` can override those actions. New lines remain visible while at the bottom; when scrolled up, the viewport stays anchored as content arrives.
+
 ## Overlays
 
 Overlays render components on top of existing content without clearing the screen. Pass `{ overlay: true }` to `ctx.ui.custom()`:
